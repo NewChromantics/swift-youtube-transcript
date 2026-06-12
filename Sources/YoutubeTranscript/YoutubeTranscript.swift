@@ -175,6 +175,9 @@ public enum YoutubeTranscript {
     let (data, _) = try await URLSession.shared.data(for: request)
 
     do {
+		let json = String(data:data, encoding: .utf8) 
+		print("Innertube caption response:\n\(json ?? "nil")")
+		
       let decoder = JSONDecoder()
       let response = try decoder.decode(InnerTubeResponse.self, from: data)
 
@@ -291,6 +294,28 @@ private struct CaptionsContainer: Codable {
   let playerCaptionsTracklistRenderer: PlayerCaptionsTracklistRenderer
 }
 
-private struct InnerTubeResponse: Codable {
-  let captions: CaptionsContainer?
+private struct InnerTubeResponse: Codable 
+{
+	let captions: CaptionsContainer?
+	var videoDetails : VideoDetails?
 }
+
+struct VideoDetails : Codable
+{
+	var title : String
+	var lengthSeconds : Int
+	var thumbnail : ThumbnailsMeta
+}
+
+struct ThumbnailsMeta : Codable
+{
+	var thumbnails : [ThumbnailMeta]
+}
+
+struct ThumbnailMeta : Codable
+{
+	var url : String
+	var width : Int
+	var height : Int
+}
+
