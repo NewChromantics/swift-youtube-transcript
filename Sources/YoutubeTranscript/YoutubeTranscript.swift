@@ -1,321 +1,456 @@
+// YoutubeTranscript.swift
+// Updated to use Android client context for Innertube API, which returns captions
+// reliably in 2025+. The WEB client no longer returns captionTracks in many cases.
+
 import Foundation
 
-#if canImport(FoundationNetworking)
-  import FoundationNetworking
-#endif
+// MARK: - Public Types
 
-public struct TranscriptResponse: Codable, Equatable, Sendable {
-  public let text: String
-  public let duration: Double
-  public let offset: Double
-  public let lang: String?
+public struct TranscriptConfig {
+	public let lang: String?
+	
+	public init(lang: String? = nil) {
+		self.lang = lang
+	}
 }
 
-public struct TranscriptConfig: Sendable {
-  public let lang: String?
-  public init(lang: String? = nil) {
-    self.lang = lang
-  }
+public struct TranscriptResponse {
+	public let text: String
+	public let offset: Double  // seconds
+	public let duration: Double
+	
+	public init(text: String, offset: Double, duration: Double) {
+		self.text = text
+		self.offset = offset
+		self.duration = duration
+	}
 }
 
-// MARK: - Errors
-public enum YoutubeTranscriptError: Error, LocalizedError, Equatable {
-  case tooManyRequests
-  case videoUnavailable(String)
-  case disabled(String)
-  case notAvailable(String)
-  case notAvailableLanguage(lang: String, availableLangs: [String], videoId: String)
-  case emptyTranscript(videoId: String, method: String)
-  case invalidVideoId
-  case networkError(String)
-  case parsingError(String)
-
-  public var errorDescription: String? {
-    switch self {
-    case .tooManyRequests:
-      return
-        "[YoutubeTranscript] 🚨 YouTube is receiving too many requests from this IP and now requires solving a captcha to continue"
-    case .videoUnavailable(let videoId):
-      return "[YoutubeTranscript] 🚨 The video is no longer available (\(videoId))"
-    case .disabled(let videoId):
-      return "[YoutubeTranscript] 🚨 Transcript is disabled on this video (\(videoId))"
-    case .notAvailable(let videoId):
-      return "[YoutubeTranscript] 🚨 No transcripts are available for this video (\(videoId))"
-    case .notAvailableLanguage(let lang, let availableLangs, let videoId):
-      return
-        "[YoutubeTranscript] 🚨 No transcripts are available in \(lang) for this video (\(videoId)). Available languages: \(availableLangs.joined(separator: ", "))"
-    case .emptyTranscript(let videoId, let method):
-      return
-        "[YoutubeTranscript] 🚨 The transcript file URL returns an empty response using \(method) (\(videoId))"
-    case .invalidVideoId:
-      return "[YoutubeTranscript] 🚨 Impossible to retrieve Youtube video ID."
-    case .networkError(let error):
-      return "[YoutubeTranscript] 🚨 Network error: \(error)"
-    case .parsingError(let message):
-      return "[YoutubeTranscript] 🚨 Parsing error: \(message)"
-    }
-  }
+public enum YoutubeTranscriptError: Error, LocalizedError {
+	case tooManyRequests
+	case videoUnavailable
+	case disabled
+	case notAvailable
+	case notAvailableLanguage(String, [String])
+	case emptyTranscript
+	case invalidVideoId
+	case networkError(Error)
+	case parsingError(String)
+	
+	public var errorDescription: String? {
+		switch self {
+			case .tooManyRequests:
+				return "YouTube is rate-limiting your IP. Try again later."
+			case .videoUnavailable:
+				return "The video is not available."
+			case .disabled:
+				return "Transcripts are disabled for this video."
+			case .notAvailable:
+				return "No transcripts are available for this video."
+			case .notAvailableLanguage(let requested, let available):
+				return "No transcript in language '\(requested)'. Available: \(available.joined(separator: ", "))"
+			case .emptyTranscript:
+				return "The transcript is empty."
+			case .invalidVideoId:
+				return "The video ID is invalid."
+			case .networkError(let underlying):
+				return "Network error: \(underlying.localizedDescription)"
+			case .parsingError(let detail):
+				return "Failed to parse YouTube response: \(detail)"
+		}
+	}
 }
 
-// MARK: - YoutubeTranscript Main Class
+// MARK: - Innertube Response Models
+
+private struct PlayerResponse: Decodable {
+	let playabilityStatus: PlayabilityStatus?
+	let captions: CaptionsWrapper?
+}
+
+private struct PlayabilityStatus: Decodable {
+	let status: String?
+	let reason: String?
+}
+
+private struct CaptionsWrapper: Decodable {
+	let playerCaptionsTracklistRenderer: TracklistRenderer?
+}
+
+private struct TracklistRenderer: Decodable {
+	let captionTracks: [CaptionTrack]?
+}
+
+private struct CaptionTrack: Decodable {
+	let baseUrl: String
+	let languageCode: String
+	let name: CaptionTrackName?
+	let kind: String?
+}
+
+private struct CaptionTrackName: Decodable {
+	let simpleText: String?
+}
+
+// MARK: - Main Entry Point
+
 public enum YoutubeTranscript {
-
-  private static let userAgent =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36,gzip(gfe)"
-
-  public static func fetchTranscript(for videoId: String, config: TranscriptConfig = .init())
-    async throws -> [TranscriptResponse]
-  {
-    // The `videoId` parameter can be a full YouTube URL or just the 11-character video ID.
-    // The `retrieveVideoId` helper function will handle extracting the ID from a URL.
-    do {
-      // First, attempt to fetch the transcript by scraping the video's HTML page.
-      return try await fetchTranscriptWithHtmlScraping(videoId: videoId, config: config)
-    } catch let error as YoutubeTranscriptError {
-      // If the HTML scraping method returns an empty transcript, we fall back to the InnerTube API.
-      if case .emptyTranscript = error {
-        return try await fetchTranscriptWithInnerTube(videoId: videoId, config: config)
-      }
-      // For any other specific transcript error, re-throw it.
-      throw error
-    }
-  }
-
-  // MARK: - Private Helper Methods
-
-  private static func fetchTranscriptWithHtmlScraping(videoId: String, config: TranscriptConfig)
-    async throws -> [TranscriptResponse]
-  {
-    let identifier = try retrieveVideoId(from: videoId)
-    guard let url = URL(string: "https://www.youtube.com/watch?v=\(identifier)") else {
-      throw YoutubeTranscriptError.invalidVideoId
-    }
-
-    var request = URLRequest(url: url)
-    if let lang = config.lang {
-      request.setValue(lang, forHTTPHeaderField: "Accept-Language")
-    }
-    request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-
-    let (data, _) = try await URLSession.shared.data(for: request)
-    guard let html = String(data: data, encoding: .utf8) else {
-      throw YoutubeTranscriptError.parsingError("Failed to decode HTML response")
-    }
-
-    if html.contains("class=\"g-recaptcha\"") {
-      throw YoutubeTranscriptError.tooManyRequests
-    }
-
-    if !html.contains("\"playabilityStatus\":") {
-      throw YoutubeTranscriptError.videoUnavailable(videoId)
-    }
-
-    let splittedHtml = html.components(separatedBy: "\"captions\":")
-
-    guard splittedHtml.count > 1 else {
-      throw YoutubeTranscriptError.disabled(videoId)
-    }
-
-    let captionsJsonString = splittedHtml[1].components(separatedBy: ",\"videoDetails")[0]
-
-    guard let captionsData = captionsJsonString.data(using: .utf8) else {
-      throw YoutubeTranscriptError.parsingError("Could not get captions data.")
-    }
-
-    do {
-      let decoder = JSONDecoder()
-      let captionsContainer = try decoder.decode(CaptionsContainer.self, from: captionsData)
-      let captions = captionsContainer.playerCaptionsTracklistRenderer
-      let processedTranscript: [TranscriptResponse] = try await processTranscriptFromCaptions(
-        captions: captions, videoId: videoId, config: config)
-
-      if processedTranscript.isEmpty {
-        throw YoutubeTranscriptError.emptyTranscript(videoId: videoId, method: "HTML scraping")
-      }
-      return processedTranscript
-    } catch let error as YoutubeTranscriptError {
-      throw error
-    } catch {
-      throw YoutubeTranscriptError.parsingError(
-        "Failed to parse captions JSON: \(error.localizedDescription)")
-    }
-  }
-
-  private static func fetchTranscriptWithInnerTube(videoId: String, config: TranscriptConfig)
-    async throws -> [TranscriptResponse]
-  {
-    let identifier = try retrieveVideoId(from: videoId)
-    guard let url = URL(string: "https://www.youtube.com/youtubei/v1/player") else {
-      throw YoutubeTranscriptError.invalidVideoId
-    }
-
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-
-    if let lang = config.lang {
-      request.setValue(lang, forHTTPHeaderField: "Accept-Language")
-    }
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
-    request.setValue("https://www.youtube.com/watch?v=\(identifier)", forHTTPHeaderField: "Referer")
-
-    let body: [String: Any] = [
-      "context": [
-        "client": [
-          "clientName": "WEB",
-          "clientVersion": "2.20250312.04.00",
-          "userAgent": userAgent,
-        ]
-      ],
-      "videoId": identifier,
-    ]
-
-    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-    let (data, _) = try await URLSession.shared.data(for: request)
-
-    do {
-		let json = String(data:data, encoding: .utf8) 
-		print("Innertube caption response:\n\(json ?? "nil")")
+	
+	/// Fetches the transcript for a YouTube video.
+	/// - Parameters:
+	///   - videoId: A YouTube video ID or supported URL format.
+	///   - config: Optional configuration (e.g. language preference).
+	/// - Returns: An array of `TranscriptResponse` items with text, offset, and duration.
+	public static func fetchTranscript(
+		for videoId: String,
+		config: TranscriptConfig = .init()
+	) async throws -> [TranscriptResponse] {
+		let id = try extractVideoId(from: videoId)
+		let videoURL = "https://www.youtube.com/watch?v=\(id)"
 		
-      let decoder = JSONDecoder()
-      let response = try decoder.decode(InnerTubeResponse.self, from: data)
-
-      guard let captions = response.captions?.playerCaptionsTracklistRenderer else {
-        throw YoutubeTranscriptError.disabled(videoId)
-      }
-
-      let processedTranscript = try await processTranscriptFromCaptions(
-        captions: captions, videoId: videoId, config: config)
-
-      if processedTranscript.isEmpty {
-        throw YoutubeTranscriptError.emptyTranscript(videoId: videoId, method: "InnerTube API")
-      }
-      return processedTranscript
-    } catch let error as YoutubeTranscriptError {
-      throw error
-    } catch {
-      throw YoutubeTranscriptError.parsingError(
-        "Failed to parse captions JSON: \(error.localizedDescription)")
-    }
-  }
-
-  private static func processTranscriptFromCaptions(
-    captions: PlayerCaptionsTracklistRenderer, videoId: String, config: TranscriptConfig
-  ) async throws -> [TranscriptResponse] {
-    let tracks = captions.captionTracks
-    if tracks.isEmpty {
-      throw YoutubeTranscriptError.notAvailable(videoId)
-    }
-
-    var track = tracks[0]
-    if let lang = config.lang {
-      guard let langTrack = tracks.first(where: { $0.languageCode == lang }) else {
-        let availableLangs = tracks.map { $0.languageCode }
-        throw YoutubeTranscriptError.notAvailableLanguage(
-          lang: lang, availableLangs: availableLangs, videoId: videoId)
-      }
-      track = langTrack
-    }
-
-    var request = URLRequest(url: track.baseUrl)
-    if let lang = config.lang {
-      request.setValue(lang, forHTTPHeaderField: "Accept-Language")
-    }
-    request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-
-    let (data, response) = try await URLSession.shared.data(for: request)
-
-    guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-      throw YoutubeTranscriptError.notAvailable(videoId)
-    }
-
-    guard let xmlString = String(data: data, encoding: .utf8) else {
-      throw YoutubeTranscriptError.parsingError("Failed to decode XML transcript")
-    }
-
-    let regex = try! NSRegularExpression(
-      pattern: "<text start=\"([^\"]*)\" dur=\"([^\"]*)\">([^<]*)<\\/text>")
-    let range = NSRange(xmlString.startIndex..., in: xmlString)
-    let matches = regex.matches(in: xmlString, range: range)
-
-    return matches.map { match in
-      let textRange = match.range(at: 3)
-      let durationRange = match.range(at: 2)
-      let offsetRange = match.range(at: 1)
-
-      let text = (xmlString as NSString).substring(with: textRange)
-        .replacingOccurrences(of: "&#39;", with: "'")
-        .replacingOccurrences(of: "&amp;", with: "&")
-        .replacingOccurrences(of: "&quot;", with: "\"")
-
-      let durationStr = (xmlString as NSString).substring(with: durationRange)
-      let offsetStr = (xmlString as NSString).substring(with: offsetRange)
-
-      return TranscriptResponse(
-        text: text,
-        duration: Double(durationStr) ?? 0.0,
-        offset: Double(offsetStr) ?? 0.0,
-        lang: config.lang ?? track.languageCode
-      )
-    }
-  }
-
-  private static func retrieveVideoId(from string: String) throws -> String {
-    if string.count == 11 {
-      return string
-    }
-    let regex = try! NSRegularExpression(
-      pattern:
-        "(?:youtube\\.com\\/(?:[^\\/]+\\/.+\\/|(?:v|e(?:mbed)?|shorts)\\/|.*[?&]v=)|youtu\\.be\\/)([^\"&?\\/\\s]{11})",
-      options: .caseInsensitive
-    )
-    let range = NSRange(string.startIndex..., in: string)
-    if let match = regex.firstMatch(in: string, range: range) {
-      if let videoIdRange = Range(match.range(at: 1), in: string) {
-        return String(string[videoIdRange])
-      }
-    }
-    throw YoutubeTranscriptError.invalidVideoId
-  }
+		// Step 1: Fetch the video page HTML to extract INNERTUBE_API_KEY
+		let html = try await fetchHTML(url: videoURL)
+		
+		// Check for rate limiting
+		if html.contains("class=\"g-recaptcha\"") || html.contains("Sorry for the interruption") {
+			throw YoutubeTranscriptError.tooManyRequests
+		}
+		
+		let apiKey = try extractInnertubeApiKey(from: html)
+		
+		// Step 2: Call the Innertube player API using Android client context
+		// The Android client reliably returns captionTracks; the WEB client often does not.
+		let playerResponse = try await fetchPlayerResponse(videoId: id, apiKey: apiKey)
+		
+		// Check playability
+		if let status = playerResponse.playabilityStatus?.status,
+		   status == "ERROR" || status == "UNPLAYABLE" || status == "LOGIN_REQUIRED" {
+			throw YoutubeTranscriptError.videoUnavailable
+		}
+		
+		// Step 3: Find the caption track URL
+		guard let tracklist = playerResponse.captions?.playerCaptionsTracklistRenderer,
+			  let tracks = tracklist.captionTracks, !tracks.isEmpty else {
+			throw YoutubeTranscriptError.disabled
+		}
+		
+		let track = try selectTrack(from: tracks, lang: config.lang)
+		
+		// Remove &fmt=... suffix so we always get the plain XML format
+		let baseUrl = track.baseUrl
+			.replacingOccurrences(of: #"&fmt=\w+"#, with: "", options: .regularExpression)
+		
+		// Step 4: Fetch and parse the captions XML
+		let transcriptItems = try await fetchAndParseTranscript(from: baseUrl)
+		
+		if transcriptItems.isEmpty {
+			throw YoutubeTranscriptError.emptyTranscript
+		}
+		
+		return transcriptItems
+	}
 }
 
-// MARK: - Internal Helper Structs
-private struct CaptionTrack: Codable {
-  let baseUrl: URL
-  let languageCode: String
-}
+// MARK: - Private Helpers
 
-private struct PlayerCaptionsTracklistRenderer: Codable {
-  let captionTracks: [CaptionTrack]
+private extension YoutubeTranscript {
+	
+	// MARK: Video ID Extraction
+	
+	static func extractVideoId(from input: String) throws -> String {
+		// Already a bare 11-char ID?
+		if input.range(of: #"^[a-zA-Z0-9_-]{11}$"#, options: .regularExpression) != nil {
+			return input
+		}
+		
+		// Standard watch URL: youtube.com/watch?v=ID
+		if let url = URL(string: input),
+		   let host = url.host,
+		   host.contains("youtube.com") || host.contains("youtu.be") {
+			
+			if host.contains("youtu.be") {
+				let id = url.pathComponents.dropFirst().first ?? ""
+				if isValidId(id) { return id }
+			}
+			
+			// /watch?v=, /shorts/, /embed/
+			let pathComponents = url.pathComponents
+			if let shortsIdx = pathComponents.firstIndex(of: "shorts"),
+			   shortsIdx + 1 < pathComponents.count {
+				let id = pathComponents[shortsIdx + 1]
+				if isValidId(id) { return id }
+			}
+			if let embedIdx = pathComponents.firstIndex(of: "embed"),
+			   embedIdx + 1 < pathComponents.count {
+				let id = pathComponents[embedIdx + 1]
+				if isValidId(id) { return id }
+			}
+			
+			if let query = url.query {
+				let params = query
+					.split(separator: "&")
+					.map { $0.split(separator: "=", maxSplits: 1).map(String.init) }
+					.filter { $0.count == 2 }
+				for param in params {
+					if param[0] == "v" && isValidId(param[1]) {
+						return param[1]
+					}
+				}
+			}
+		}
+		
+		throw YoutubeTranscriptError.invalidVideoId
+	}
+	
+	static func isValidId(_ id: String) -> Bool {
+		id.range(of: #"^[a-zA-Z0-9_-]{11}$"#, options: .regularExpression) != nil
+	}
+	
+	// MARK: Fetch HTML
+	
+	static func fetchHTML(url: String) async throws -> String {
+		guard let requestURL = URL(string: url) else {
+			throw YoutubeTranscriptError.invalidVideoId
+		}
+		var request = URLRequest(url: requestURL)
+		// Use a realistic browser User-Agent to get the full page
+		request.setValue(
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+			forHTTPHeaderField: "User-Agent"
+		)
+		request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+		
+		let (data, response) = try await URLSession.shared.data(for: request)
+		
+		if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 429 {
+			throw YoutubeTranscriptError.tooManyRequests
+		}
+		
+		guard let html = String(data: data, encoding: .utf8) else {
+			throw YoutubeTranscriptError.parsingError("Could not decode HTML as UTF-8")
+		}
+		return html
+	}
+	
+	// MARK: Extract INNERTUBE_API_KEY
+	
+	static func extractInnertubeApiKey(from html: String) throws -> String {
+		// Try the standard key pattern
+		let patterns = [
+			#""INNERTUBE_API_KEY":"([^"]+)""#,
+			#""innertubeApiKey":"([^"]+)""#,
+			#"'INNERTUBE_API_KEY':'([^']+)'"#
+		]
+		for pattern in patterns {
+			if let match = html.range(of: pattern, options: .regularExpression) {
+				let slice = String(html[match])
+				// Extract just the key value between the last pair of quotes
+				let parts = slice.components(separatedBy: "\"")
+				if parts.count >= 4 {
+					return parts[3]
+				}
+				let singleParts = slice.components(separatedBy: "'")
+				if singleParts.count >= 4 {
+					return singleParts[3]
+				}
+			}
+		}
+		// Fallback: YouTube sometimes works without the key (key may be deprecated)
+		// Use the keyless endpoint in that case
+		return "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w" // well-known public fallback
+	}
+	
+	// MARK: Fetch Player Response (Android Client)
+	
+	static func fetchPlayerResponse(videoId: String, apiKey: String) async throws -> PlayerResponse {
+		// IMPORTANT: Using ANDROID client context is the key fix.
+		// The WEB client stopped returning captionTracks for many videos in 2024/2025.
+		// The ANDROID client consistently returns them.
+		let endpoint = "https://www.youtube.com/youtubei/v1/player?key=\(apiKey)&prettyPrint=false"
+		
+		let body: [String: Any] = [
+			"context": [
+				"client": [
+					"clientName": "ANDROID",
+					"clientVersion": "20.10.38",
+					"androidSdkVersion": 30,
+					"userAgent": "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
+					"hl": "en",
+					"timeZone": "UTC",
+					"utcOffsetMinutes": 0
+				]
+			],
+			"videoId": videoId,
+			"contentCheckOk": true,
+			"racyCheckOk": true
+		]
+		
+		guard let url = URL(string: endpoint) else {
+			throw YoutubeTranscriptError.parsingError("Invalid Innertube endpoint URL")
+		}
+		guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+			throw YoutubeTranscriptError.parsingError("Failed to encode request body")
+		}
+		
+		var request = URLRequest(url: url)
+		request.httpMethod = "POST"
+		request.httpBody = bodyData
+		request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+		request.setValue(
+			"com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
+			forHTTPHeaderField: "User-Agent"
+		)
+		request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+		request.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
+		request.setValue("1", forHTTPHeaderField: "X-YouTube-Client-Name")
+		request.setValue("20.10.38", forHTTPHeaderField: "X-YouTube-Client-Version")
+		
+		do {
+			let (data, response) = try await URLSession.shared.data(for: request)
+			
+			if let httpResponse = response as? HTTPURLResponse {
+				if httpResponse.statusCode == 429 {
+					throw YoutubeTranscriptError.tooManyRequests
+				}
+				guard (200..<300).contains(httpResponse.statusCode) else {
+					throw YoutubeTranscriptError.parsingError("HTTP \(httpResponse.statusCode) from player API")
+				}
+			}
+			
+			let decoder = JSONDecoder()
+			return try decoder.decode(PlayerResponse.self, from: data)
+		} catch let error as YoutubeTranscriptError {
+			throw error
+		} catch let decodingError as DecodingError {
+			throw YoutubeTranscriptError.parsingError("Decoding error: \(decodingError)")
+		} catch {
+			throw YoutubeTranscriptError.networkError(error)
+		}
+	}
+	
+	// MARK: Select Caption Track
+	
+	static func selectTrack(from tracks: [CaptionTrack], lang: String?) throws -> CaptionTrack {
+		// Filter out auto-generated ASR tracks if a manual one exists
+		let manualTracks = tracks.filter { $0.kind != "asr" }
+		
+		if let requestedLang = lang {
+			// Try exact match first
+			if let track = tracks.first(where: { $0.languageCode == requestedLang }) {
+				return track
+			}
+			// Try prefix match (e.g. "en" matches "en-US")
+			if let track = tracks.first(where: { $0.languageCode.hasPrefix(requestedLang) }) {
+				return track
+			}
+			let available = tracks.map { $0.languageCode }
+			throw YoutubeTranscriptError.notAvailableLanguage(requestedLang, available)
+		}
+		
+		// No language specified: prefer English manual, then any manual, then any track
+		if let enTrack = manualTracks.first(where: { $0.languageCode.hasPrefix("en") }) {
+			return enTrack
+		}
+		if let firstManual = manualTracks.first {
+			return firstManual
+		}
+		// Fall back to ASR / auto-generated
+		if let enAsr = tracks.first(where: { $0.languageCode.hasPrefix("en") }) {
+			return enAsr
+		}
+		guard let first = tracks.first else {
+			throw YoutubeTranscriptError.notAvailable
+		}
+		return first
+	}
+	
+	// MARK: Fetch and Parse Transcript XML
+	
+	static func fetchAndParseTranscript(from urlString: String) async throws -> [TranscriptResponse] {
+		guard let url = URL(string: urlString) else {
+			throw YoutubeTranscriptError.parsingError("Invalid transcript URL: \(urlString)")
+		}
+		
+		let (data, _) = try await URLSession.shared.data(from: url)
+		guard let xml = String(data: data, encoding: .utf8) else {
+			throw YoutubeTranscriptError.parsingError("Could not decode transcript XML as UTF-8")
+		}
+		
+		return try parseTranscriptXML(xml)
+	}
+	
+	// MARK: Parse Transcript XML (no external dependencies)
+	
+	/// Parses YouTube's transcript XML format:
+	/// <transcript>
+	///   <text start="0.5" dur="2.5">Hello world</text>
+	///   ...
+	/// </transcript>
+	static func parseTranscriptXML(_ xml: String) throws -> [TranscriptResponse] {
+		// Use a simple regex-based approach to avoid requiring XMLParser delegate boilerplate.
+		// For a production library, an XMLParser delegate is cleaner; this is dependency-free.
+		let pattern = #"<text[^>]+start="([^"]+)"[^>]*dur="([^"]+)"[^>]*>([\s\S]*?)<\/text>"#
+		guard let regex = try? NSRegularExpression(pattern: pattern) else {
+			throw YoutubeTranscriptError.parsingError("Failed to compile transcript regex")
+		}
+		
+		let nsXML = xml as NSString
+		let matches = regex.matches(in: xml, range: NSRange(location: 0, length: nsXML.length))
+		
+		var results: [TranscriptResponse] = []
+		for match in matches {
+			guard match.numberOfRanges == 4 else { continue }
+			
+			let startStr  = nsXML.substring(with: match.range(at: 1))
+			let durStr    = nsXML.substring(with: match.range(at: 2))
+			let rawText   = nsXML.substring(with: match.range(at: 3))
+			
+			guard let start = Double(startStr), let dur = Double(durStr) else { continue }
+			
+			let cleanText = unescapeHTML(rawText)
+				.trimmingCharacters(in: .whitespacesAndNewlines)
+			
+			if !cleanText.isEmpty {
+				results.append(TranscriptResponse(text: cleanText, offset: start, duration: dur))
+			}
+		}
+		
+		return results
+	}
+	
+	/// Decodes common HTML entities found in YouTube caption XML.
+	static func unescapeHTML(_ input: String) -> String {
+		var result = input
+		let entities: [(String, String)] = [
+			("&amp;",   "&"),
+			("&lt;",    "<"),
+			("&gt;",    ">"),
+			("&quot;",  "\""),
+			("&#39;",   "'"),
+			("&apos;",  "'"),
+			("&#x27;",  "'"),
+			("&#x2F;",  "/"),
+			("&nbsp;",  " "),
+			// YouTube sometimes encodes newlines
+			("&#10;",   " "),
+			("&#13;",   " ")
+		]
+		for (entity, char) in entities {
+			result = result.replacingOccurrences(of: entity, with: char)
+		}
+		// Handle numeric decimal entities like &#123;
+		if let regex = try? NSRegularExpression(pattern: #"&#(\d+);"#) {
+			let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+			// Iterate in reverse to preserve indices
+			for match in matches.reversed() {
+				if let range = Range(match.range, in: result),
+				   let codeRange = Range(match.range(at: 1), in: result),
+				   let codePoint = UInt32(result[codeRange]),
+				   let scalar = Unicode.Scalar(codePoint) {
+					result.replaceSubrange(range, with: String(scalar))
+				}
+			}
+		}
+		return result
+	}
 }
-
-private struct CaptionsContainer: Codable {
-  let playerCaptionsTracklistRenderer: PlayerCaptionsTracklistRenderer
-}
-
-private struct InnerTubeResponse: Codable 
-{
-	let captions: CaptionsContainer?
-	var videoDetails : VideoDetails?
-}
-
-struct VideoDetails : Codable
-{
-	var title : String
-	var lengthSeconds : Int
-	var thumbnail : ThumbnailsMeta
-}
-
-struct ThumbnailsMeta : Codable
-{
-	var thumbnails : [ThumbnailMeta]
-}
-
-struct ThumbnailMeta : Codable
-{
-	var url : String
-	var width : Int
-	var height : Int
-}
-
