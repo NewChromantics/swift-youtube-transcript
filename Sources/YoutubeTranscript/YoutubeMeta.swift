@@ -4,6 +4,8 @@
 import Foundation
 
 
+
+
 public struct Video
 {
 	private static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36,gzip(gfe)"
@@ -99,11 +101,16 @@ public struct Video
 
 public struct InnerTubeResponse: Codable 
 {
-	public var videoDetails : VideoDetails?
+	public var videoDetails : VideoDetails
+	public var microformat : Microformat
 	public var thumbnail : URL?				
 	{
-		videoDetails?.thumbnail.thumbnails.first.map{ URL(string:$0.url) } ?? nil
+		videoDetails.thumbnail.thumbnails.first.map{ URL(string:$0.url) } ?? nil
 	}
+	public var url : URL?				{	URL(string: microformat.playerMicroformatRenderer.canonicalUrl)	}
+	public var viewCount : Int			{	Int(microformat.playerMicroformatRenderer.viewCount) ?? -1	} 
+
+
 }
 
 public struct VideoDetails : Codable
@@ -112,6 +119,57 @@ public struct VideoDetails : Codable
 	public var shortDescription : String
 	public var lengthSeconds : String		//	always an int? but in a string!
 	public var thumbnail : ThumbnailsMeta
+}
+
+
+
+public struct Microformat: Codable 
+{
+	public let playerMicroformatRenderer: PlayerMicroformatRenderer
+
+}
+
+public struct PlayerMicroformatRenderer: Codable {
+	public let thumbnail: ThumbnailContainer
+	public let embed: Embed
+	public let title: SimpleTextContainer
+	public let description: SimpleTextContainer
+	public let lengthSeconds: String
+	public let ownerProfileUrl: String
+	public let externalChannelId: String
+	public let isFamilySafe: Bool
+	public let availableCountries: [String]
+	public let isUnlisted: Bool
+	public let hasYpcMetadata: Bool
+	public let viewCount: String
+	public let category: String
+	public let publishDate: String
+	public let ownerChannelName: String
+	public let uploadDate: String
+	public let isShortsEligible: Bool
+	public let externalVideoId: String
+	public let likeCount: String
+	public let canonicalUrl: String
+}
+
+public struct ThumbnailContainer: Codable {
+	public let thumbnails: [Thumbnail]
+}
+
+public struct Thumbnail: Codable {
+	public let url: String
+	public let width: Int
+	public let height: Int
+}
+
+public struct Embed: Codable {
+	public let iframeUrl: String
+	public let width: Int
+	public let height: Int
+}
+
+public struct SimpleTextContainer: Codable {
+	public let simpleText: String
 }
 
 public struct ThumbnailsMeta : Codable
